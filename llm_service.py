@@ -28,6 +28,20 @@ class BaseLLMService:
         """Generate explanation for match score"""
         raise NotImplementedError
 
+    async def extract_job_listings(self, page_text: str, source_name: str) -> list:
+        """
+        LLM-assisted parsing: given the visible text of a job-search
+        results page, extract structured job listings as a list of dicts.
+
+        NOTE: this is functionally equivalent to scraping - the LLM is
+        doing the parsing instead of regex/BeautifulSoup selectors, but
+        the legal/ToS status of fetching+extracting a site's listings is
+        unchanged either way. This was an explicit, informed decision for
+        the MVP-validation stage (see sources.py) - revisit before any
+        real launch/scale-up.
+        """
+        raise NotImplementedError
+
 
 class AnthropicLLMService(BaseLLMService):
     """Anthropic/Claude LLM service"""
@@ -167,6 +181,52 @@ Explanation:"""
         except Exception as e:
             logger.warning(f"Claude explanation generation failed: {e}")
             return "Interesting opportunity matching your criteria"
+
+    async def extract_job_listings(self, page_text: str, source_name: str) -> list:
+        """Extract structured job listings from raw page text using Claude"""
+        if not self.available:
+            logger.warning(f"⚠ Claude unavailable - cannot LLM-parse {source_name}, returning no jobs")
+            return []
+
+        # Keep the prompt bounded - search result pages can be long
+        truncated = page_text[:12000]
+
+        prompt = f"""Below is the visible text of a job search results page from {source_name}.
+Extract every distinct job listing you can find and return ONLY a valid JSON array,
+no other text. Each item must have exactly these keys (use null when not present):
+title, company, location, salary_min, salary_max, currency, contract_type,
+work_location, required_skills, url, published_date
+
+salary_min/salary_max must be integers or null (strip currency symbols/text).
+url should be the full listing URL if present in the text, else null.
+If you find no listings, return an empty array: []
+
+PAGE TEXT:
+{truncated}
+
+JSON array:"""
+
+        try:
+            message = self.client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip()
+            # Strip markdown code fences if the model added them anyway
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            import json
+            listings = json.loads(raw)
+            if not isinstance(listings, list):
+                logger.warning(f"Claude job extraction for {source_name} did not return a list")
+                return []
+            return listings
+        except Exception as e:
+            logger.warning(f"Claude job-listing extraction failed for {source_name}: {e}")
+            return []
 
     def _detect_language_fallback(self, text: str) -> str:
         """Fallback language detection using simple heuristics"""
@@ -315,6 +375,50 @@ Job: {job.get('title')} at {job.get('company')}"""
         except Exception as e:
             logger.warning(f"GPT explanation generation failed: {e}")
             return "Interesting opportunity"
+
+    async def extract_job_listings(self, page_text: str, source_name: str) -> list:
+        """Extract structured job listings from raw page text using GPT"""
+        if not self.available:
+            logger.warning(f"⚠ GPT unavailable - cannot LLM-parse {source_name}, returning no jobs")
+            return []
+
+        truncated = page_text[:12000]
+
+        prompt = f"""Below is the visible text of a job search results page from {source_name}.
+Extract every distinct job listing you can find and return ONLY a valid JSON array,
+no other text. Each item must have exactly these keys (use null when not present):
+title, company, location, salary_min, salary_max, currency, contract_type,
+work_location, required_skills, url, published_date
+
+salary_min/salary_max must be integers or null (strip currency symbols/text).
+url should be the full listing URL if present in the text, else null.
+If you find no listings, return an empty array: []
+
+PAGE TEXT:
+{truncated}
+
+JSON array:"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                max_tokens=4000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            import json
+            listings = json.loads(raw)
+            if not isinstance(listings, list):
+                logger.warning(f"GPT job extraction for {source_name} did not return a list")
+                return []
+            return listings
+        except Exception as e:
+            logger.warning(f"GPT job-listing extraction failed for {source_name}: {e}")
+            return []
 
     def _detect_language_fallback(self, text: str) -> str:
         """Fallback detection"""
