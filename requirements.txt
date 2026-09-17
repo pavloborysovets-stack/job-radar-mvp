@@ -16,7 +16,6 @@ pydantic-settings==2.1.0      # Environment variables
 
 # ========== TELEGRAM BOT ==========
 python-telegram-bot==20.3     # Telegram bot API
-telegram-bot-api==6.7         # Telegram API types
 
 # ========== LLM INTEGRATION ==========
 anthropic==0.7.11             # Anthropic/Claude API
@@ -24,7 +23,7 @@ openai==1.3.0                 # OpenAI/GPT API
 httpx==0.25.0                 # HTTP client (for LLM APIs)
 
 # ========== ASYNC & CONCURRENCY ==========
-asyncio==3.4.3                # Already included in Python 3.7+
+# asyncio is part of the Python standard library (3.7+) - no package needed
 aiohttp==3.9.0                # Async HTTP requests
 
 # ========== LOGGING & MONITORING ==========
