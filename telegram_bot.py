@@ -4,6 +4,7 @@ Job Radar MVP - Telegram Bot with FSM
 Supports: Russian, English, Polish, Ukrainian
 """
 
+import html
 import logging
 from enum import Enum
 from typing import Dict
@@ -19,6 +20,7 @@ from telegram.ext import (
     BaseHandler,
 )
 from datetime import datetime
+from sources import JobSourceManager
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,7 @@ class TelegramBotHandler:
         """
         self.token = token
         self.application = None
+        self.source_manager = JobSourceManager()
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
         """Handle /start command"""
@@ -293,9 +296,21 @@ class TelegramBotHandler:
         text = self._get_text("searching", language)
         await query.edit_message_text(text)
 
-        # In production: fetch real jobs and rank them
-        # For MVP: use mock data
-        jobs = self._get_mock_jobs()
+        criteria = {
+            "job_title": context.user_data.get("job_type", ""),
+            "geography": context.user_data.get("geography", "trojmiasto"),
+            "salary_min": context.user_data.get("min_salary"),
+        }
+
+        try:
+            jobs = await self.source_manager.fetch_all_jobs(criteria)
+        except Exception as e:
+            logger.error(f"✗ Job search failed: {e}")
+            jobs = []
+
+        logger.info(f"Search for user {context.user_data.get('user_id')}: "
+                    f"criteria={criteria} -> {len(jobs)} real jobs found")
+
         context.user_data["jobs"] = jobs
         context.user_data["current_job_index"] = 0
 
@@ -333,19 +348,43 @@ class TelegramBotHandler:
 
         job = jobs[index]
 
-        # Format job text
-        job_text = f"""
-<b>{job['title']}</b>
-{job['company']} • {job['location']}
+        # Format job text - real sources (Adzuna, CBOP) often omit salary,
+        # contract type or work mode. Never invent a value for a missing
+        # field (see PRODUCT_EXECUTION_SPEC.md section 13) - show it as
+        # "not specified" instead, and never let a missing number crash
+        # the ":,"-formatted salary line.
+        salary_min = job.get("salary_min")
+        salary_max = job.get("salary_max")
+        if salary_min and salary_max:
+            salary_line = f"💰 {salary_min:,.0f} - {salary_max:,.0f} PLN"
+        elif salary_min:
+            salary_line = f"💰 from {salary_min:,.0f} PLN"
+        elif salary_max:
+            salary_line = f"💰 up to {salary_max:,.0f} PLN"
+        else:
+            salary_line = "💰 Salary not specified"
 
-💰 {job['salary_min']:,} - {job['salary_max']:,} PLN
-📋 {job['contract_type']}
-📍 {job['work_location']}
+        contract_type = job.get("contract_type") or "Not specified"
+        work_location = job.get("work_location") or "Not specified"
+        required_skills = job.get("required_skills") or job.get("requirements") or "—"
+        source_name = job.get("source") or ""
+
+        def esc(value):
+            return html.escape(str(value)) if value else value
+
+        job_text = f"""
+<b>{esc(job.get('title', 'Untitled'))}</b>
+{esc(job.get('company', 'N/A'))} • {esc(job.get('location', 'Trójmiasto'))}
+
+{salary_line}
+📋 {esc(contract_type)}
+📍 {esc(work_location)}
 
 <b>Requirements:</b>
-{job['required_skills']}
+{esc(required_skills)}
 
-<a href="{job['url']}">View Full Job →</a>
+Source: {esc(source_name)}
+<a href="{job.get('url', '#')}">View Full Job →</a>
 """
 
         text = self._get_text("job_found", language).format(
@@ -432,43 +471,13 @@ class TelegramBotHandler:
 • Location: {user_data.get('geography', 'trojmiasto')}
 """
 
-    def _get_mock_jobs(self) -> list:
-        """Get mock jobs for MVP"""
-        return [
-            {
-                "title": "Python Backend Developer",
-                "company": "TechCorp",
-                "location": "Gdańsk",
-                "salary_min": 8000,
-                "salary_max": 12000,
-                "contract_type": "Full-time",
-                "work_location": "On-site",
-                "required_skills": "Python, FastAPI, PostgreSQL",
-                "url": "https://example.com/job/1",
-            },
-            {
-                "title": "Frontend Developer",
-                "company": "WebStudio",
-                "location": "Sopot",
-                "salary_min": 6500,
-                "salary_max": 9500,
-                "contract_type": "Full-time",
-                "work_location": "Hybrid",
-                "required_skills": "React, TypeScript, CSS",
-                "url": "https://example.com/job/2",
-            },
-            {
-                "title": "Data Scientist",
-                "company": "DataWorks",
-                "location": "Gdynia",
-                "salary_min": 9000,
-                "salary_max": 15000,
-                "contract_type": "Full-time",
-                "work_location": "Hybrid",
-                "required_skills": "Python, SQL, ML, TensorFlow",
-                "url": "https://example.com/job/3",
-            },
-        ]
+    # NOTE: the old _get_mock_jobs() (3 hardcoded IT listings) was removed
+    # 2026-09-18. It was the actual root cause of the "always shows 3 IT
+    # jobs no matter what I search for" bug - confirm_criteria() called it
+    # directly and never invoked JobSourceManager at all. Real listings now
+    # come from self.source_manager.fetch_all_jobs() in confirm_criteria().
+    # Mock data belongs only in tests (see PRODUCT_EXECUTION_SPEC.md
+    # section 56), never in this production code path.
 
     async def setup(self):
         """Set up conversation handler"""
