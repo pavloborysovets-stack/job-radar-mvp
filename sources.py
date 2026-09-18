@@ -9,16 +9,36 @@ A source now either:
   (b) is not implemented yet and returns an EMPTY list with a clear log
       message - it never invents data.
 
-Currently real: CBOPSource (Poland's official government job-offer
-database, "Centralna Baza Ofert Pracy" / ePraca, CC BY 4.0 license,
-https://dane.gov.pl/pl/dataset/538,oferty-pracy-psz). It requires a
-"Partner" access code issued by the Ministry (Ministerstwo Rodziny,
-Pracy i Polityki Spolecznej) - set it via the CBOP_PARTNER_CODE
-environment variable. Until that code is configured, CBOPSource also
-returns an empty list rather than failing.
+Currently real:
+  - AdzunaSource (https://developer.adzuna.com) - official job-search
+    aggregator API, free tier. Primary real-data source for MVP
+    validation (see PRODUCT_EXECUTION_SPEC.md section 18). Requires
+    ADZUNA_APP_ID and ADZUNA_APP_KEY environment variables (free
+    self-serve signup, no partner approval needed). Manually verified
+    2026-09-18 that Adzuna's Poland/Gdansk results include listings
+    originally posted on pracuj.pl, and span many categories beyond
+    IT (construction, engineering, logistics, etc).
+  - CBOPSource (Poland's official government job-offer database,
+    "Centralna Baza Ofert Pracy" / ePraca, CC BY 4.0 license,
+    https://dane.gov.pl/pl/dataset/538,oferty-pracy-psz). It requires a
+    "Partner" access code issued by the Ministry (Ministerstwo Rodziny,
+    Pracy i Polityki Spolecznej) - set it via the CBOP_PARTNER_CODE
+    environment variable. Until that code is configured, CBOPSource
+    also returns an empty list rather than failing.
 
-Everything else (pracuj.pl, OLX, LinkedIn, Indeed, Telegram channels)
-is a placeholder adapter matching ARCHITECTURE.md's target source list,
+DISABLED (2026-09-18): PracujPlSource used to scrape pracuj.pl's live
+search-results HTML directly (parsed via LLM instead of hand-written
+selectors, but still functionally scraping - not an official API).
+Per PRODUCT_EXECUTION_SPEC.md sections 19/21/47 ("legal access channel
+or another source, not a workaround"), this is no longer acceptable
+even for MVP validation, especially now that Adzuna legally covers a
+meaningful share of pracuj.pl's own listings. The class and its
+fetch/parse mechanism are kept in this file for reference (it may be
+reusable later against a source that actually permits this), but it
+is no longer instantiated by JobSourceManager.
+
+Everything else (OLX, LinkedIn, Indeed, Telegram channels) is a
+placeholder adapter matching ARCHITECTURE.md's target source list,
 waiting on real (legal, ToS-compliant) integration work.
 """
 
@@ -264,6 +284,133 @@ class CBOPSource(JobSource):
             return None
 
 
+# ========== REAL SOURCE: Adzuna (job-search aggregator API) ==========
+
+class AdzunaSource(JobSource):
+    """
+    Adzuna (https://developer.adzuna.com) - official, legal job-search
+    aggregator API covering Poland (country code "pl"). Free tier:
+    instant self-serve App ID + App Key registration, no partner
+    approval needed, capped at a few hundred calls/day - plenty for
+    MVP validation with 10-20 users.
+
+    Manually verified 2026-09-18 against https://www.adzuna.pl that
+    results include listings sourced from pracuj.pl, and that Gdansk
+    results span many categories, not only IT (example breakdown seen:
+    IT 862, Inna/ogolna 404, Ksiegowosc i finanse 247, Sprzedaz 230,
+    Inzynieria 194, Budownictwo 186, Obsluga klienta 165, Logistyka i
+    magazyn 97, Produkcja 80, Administracja 46).
+
+    Set ADZUNA_APP_ID and ADZUNA_APP_KEY in the environment. Until
+    both are configured, this source returns an empty list rather
+    than failing or inventing data.
+    """
+
+    SEARCH_URL = "https://api.adzuna.com/v1/api/jobs/{country}/search/{page}"
+
+    def __init__(self):
+        super().__init__(
+            name="Adzuna",
+            url="https://www.adzuna.pl",
+            source_type="api",
+        )
+        self.app_id = os.getenv("ADZUNA_APP_ID", "").strip()
+        self.app_key = os.getenv("ADZUNA_APP_KEY", "").strip()
+        self.country = os.getenv("ADZUNA_COUNTRY", "pl").strip() or "pl"
+
+    async def fetch_jobs(self, criteria: Dict = None) -> List[Dict]:
+        if not self.app_id or not self.app_key:
+            logger.warning(
+                "⚠ ADZUNA_APP_ID/ADZUNA_APP_KEY not set - skipping Adzuna source "
+                "(free signup at https://developer.adzuna.com/signup). "
+                "Returning no jobs, not fake ones."
+            )
+            return []
+
+        criteria = criteria or {}
+        params = self._build_params(criteria)
+        url = self.SEARCH_URL.format(country=self.country, page=1)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=20)
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error(f"✗ Adzuna request failed: HTTP {resp.status} - {body[:300]}")
+                        return []
+                    data = await resp.json()
+        except Exception as e:
+            logger.error(f"✗ Error fetching from Adzuna: {e}")
+            return []
+
+        results = data.get("results", [])
+        jobs = [self._normalize(item) for item in results]
+        jobs = [j for j in jobs if j]
+        logger.info(f"✓ Fetched {len(jobs)} jobs from Adzuna")
+        return jobs
+
+    def _build_params(self, criteria: Dict) -> Dict:
+        # criteria keys match what telegram_bot.py's search profile
+        # produces: job_title / category_keywords (what to search for),
+        # geography (where), salary_min, exclude_categories.
+        what = (
+            criteria.get("job_title")
+            or criteria.get("category_keywords")
+            or criteria.get("free_text")
+            or ""
+        ).strip()
+        geography = (criteria.get("geography") or "Trojmiasto").strip()
+        where = "Gdansk" if geography.lower() in ("trojmiasto", "") else geography
+
+        params = {
+            "app_id": self.app_id,
+            "app_key": self.app_key,
+            "results_per_page": "20",
+            "where": where,
+            "content-type": "application/json",
+        }
+        if what:
+            params["what"] = what
+
+        salary_min = criteria.get("salary_min")
+        if salary_min:
+            try:
+                params["salary_min"] = str(int(salary_min))
+            except (TypeError, ValueError):
+                pass
+
+        return params
+
+    def _normalize(self, item: Dict) -> Optional[Dict]:
+        if not isinstance(item, dict) or not item.get("title"):
+            return None
+        location = item.get("location") or {}
+        company = item.get("company") or {}
+        category = item.get("category") or {}
+        return {
+            "title": item.get("title"),
+            "company": company.get("display_name") or "N/A",
+            "location": location.get("display_name") or "Trojmiasto",
+            "salary_min": item.get("salary_min"),
+            "salary_max": item.get("salary_max"),
+            "currency": "PLN",
+            # Adzuna often omits these - leave None rather than inventing
+            # "full-time"/"on-site" (see PRODUCT_EXECUTION_SPEC.md section 13:
+            # never invent missing data, show "not specified" instead).
+            "contract_type": item.get("contract_type") or item.get("contract_time"),
+            "work_location": None,
+            "required_skills": "",
+            "requirements": "",
+            "benefits": "[]",
+            "description": item.get("description") or "",
+            "url": item.get("redirect_url") or self.url,
+            "published_date": item.get("created") or datetime.utcnow().isoformat(),
+            "category": category.get("label") or "",
+        }
+
+
 # ========== PLACEHOLDER SOURCES (not yet implemented - no fake data) ==========
 
 class _NotYetImplementedSource(JobSource):
@@ -283,18 +430,25 @@ class _NotYetImplementedSource(JobSource):
 
 class PracujPlSource(JobSource):
     """
-    pracuj.pl - no official public API for third parties. This fetches
-    the public search-results page (plain HTTP, no login/paywall
+    DISABLED as of 2026-09-18 - NOT instantiated by JobSourceManager.
+    Kept in this file only so the fetch/parse mechanism (fetch a public
+    search-results page, hand the visible text to an LLM instead of
+    hand-written HTML selectors) is not lost - it may be worth reusing
+    against a source that actually permits this kind of access.
+
+    pracuj.pl has no official public API for third parties. This class
+    fetches the public search-results page (plain HTTP, no login/paywall
     bypass) and uses an LLM (via llm_service.py) to parse the visible
-    text into structured job listings instead of hand-written
-    HTML selectors.
+    text into structured job listings.
 
     IMPORTANT: this is functionally scraping - using an LLM to parse
     the page instead of regex/BeautifulSoup selectors does not change
-    its legal/ToS status. This was an explicit, informed decision by
-    the product owner for the MVP-validation stage only (2026-09-17);
-    revisit before any real launch or scale-up (see ARCHITECTURE.md's
-    "only legal/permitted sources" constraint).
+    its legal/ToS status. It was enabled for one day (2026-09-17) as
+    an MVP-validation shortcut, then disabled 2026-09-18 once Adzuna
+    (a legal aggregator API that already surfaces pracuj.pl listings)
+    was connected instead - see PRODUCT_EXECUTION_SPEC.md sections
+    19/21/47 ("legal access channel or another source, not a
+    workaround"). Do not re-enable without a real ToS/legal review.
     """
 
     def __init__(self):
@@ -427,8 +581,10 @@ class JobSourceManager:
     def __init__(self):
         """Initialize all sources"""
         self.sources = {
+            "adzuna": AdzunaSource(),
             "cbop": CBOPSource(),
-            "pracuj": PracujPlSource(),
+            # "pracuj" (PracujPlSource) intentionally NOT included here -
+            # disabled 2026-09-18, see the class docstring for why.
             "olx": OLXSource(),
             "linkedin": LinkedInSource(),
             "indeed": IndeedSource(),
@@ -496,7 +652,7 @@ class JobSourceManager:
                 "name": source.name,
                 "url": source.url,
                 "type": source.source_type,
-                "implemented": isinstance(source, (CBOPSource, PracujPlSource)),
+                "implemented": isinstance(source, (AdzunaSource, CBOPSource)),
             }
             for key, source in self.sources.items()
         ]
@@ -510,12 +666,13 @@ from sources import JobSourceManager
 async def main():
     manager = JobSourceManager()
 
-    # Fetch from all sources (only CBOP will return real data until
-    # CBOP_PARTNER_CODE is set and the other adapters are implemented)
+    # Fetch from all sources (Adzuna returns real data once
+    # ADZUNA_APP_ID/ADZUNA_APP_KEY are set; CBOP once CBOP_PARTNER_CODE
+    # is set; the rest are placeholders until implemented)
     all_jobs = await manager.fetch_all_jobs()
 
-    # Fetch from the government source specifically
-    cbop_jobs = await manager.fetch_from_source("cbop")
+    # Fetch from Adzuna specifically
+    adzuna_jobs = await manager.fetch_from_source("adzuna")
 
     sources = manager.get_available_sources()
     print(sources)
